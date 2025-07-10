@@ -51,9 +51,9 @@ import org.apache.commons.cli.ParseException;
 public class SpannerDataLoader {
 
   // Default configuration values
-  private static final int DEFAULT_NUM_KEYS = 10_000_000;
-  private static final int DEFAULT_BATCH_SIZE = 1000;
-  private static final int DEFAULT_NUM_THREADS = 128;
+  private static final int DEFAULT_NUM_KEYS = 30_000_000;
+  private static final int DEFAULT_BATCH_SIZE = 2000;
+  private static final int DEFAULT_NUM_THREADS = 512;
   private static final String KEY_PREFIX = "deterministic-key-";
   private static final int EDGE_KEY_OFFSET = 250000;
 

@@ -171,19 +171,30 @@ public class ThroughputRunner {
             break;
           }
           case "findOrCreateEdge": {
-            String key1, key2;
+            String key1, key2, label1, label2, edgeLabel;
             if (random.nextDouble() < 0.30) {
-              // 30% of the time, create a new edge from a new node to an existing node.
-              key1 = NEW_KEY_PREFIX + (keyStartOffset + currentIndex);
-              key2 = KEY_PREFIX + (keyStartOffset + currentIndex + EDGE_KEY_OFFSET);
+              // 30% of the time, create a new edge between two existing, pre-loaded nodes.
+              // The edge itself is new because of the prefixed edge label.
+              int sourceIndex = random.nextInt(numTotalKeys);
+              int destIndex;
+              do {
+                destIndex = random.nextInt(numTotalKeys);
+              } while (sourceIndex == destIndex); // Avoid self-loops
+
+              key1 = KEY_PREFIX + (keyStartOffset + sourceIndex);
+              label1 = "label-" + ((keyStartOffset + sourceIndex) % 100);
+              key2 = KEY_PREFIX + (keyStartOffset + destIndex);
+              label2 = "label-" + ((keyStartOffset + destIndex) % 100);
+              edgeLabel = "new-edgelabel-" + (currentIndex % 100); // Use a new prefix to force creation
+
             } else {
               // 70% of the time, find an edge that should already exist.
               key1 = KEY_PREFIX + (keyStartOffset + currentIndex);
+              label1 = "label-" + ((keyStartOffset + currentIndex) % 100);
               key2 = KEY_PREFIX + (keyStartOffset + currentIndex + EDGE_KEY_OFFSET);
+              label2 = "label-" + ((keyStartOffset + currentIndex + EDGE_KEY_OFFSET) % 100);
+              edgeLabel = "edgelabel-" + (currentIndex % 100);
             }
-            String label1 = "label-" + ((keyStartOffset + currentIndex) % 100);
-            String label2 = "label-" + ((keyStartOffset + currentIndex + EDGE_KEY_OFFSET) % 100);
-            String edgeLabel = "edgelabel-" + (currentIndex % 100);
             dispatchFuture = findOrCreateEdgeAsync(dbClient, label1, key1, edgeLabel, key2, label2,
                 hardcodedDetails, 0, executorService);
             break;
