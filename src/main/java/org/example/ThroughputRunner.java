@@ -429,7 +429,8 @@ public class ThroughputRunner {
         txn -> {
           // First, read to see if the node already exists.
           ApiFuture<Struct> existingNodeFut =
-              txn.readRowAsync("GraphNode", Key.of(label, key), ImmutableList.of("key"));
+              txn.readRowAsync("GraphNode", Key.of(label, key),
+                      ImmutableList.of("details", "first_seen", "last_seen", "creation_ts", "update_ts"));
 
           return ApiFutures.transformAsync(
               existingNodeFut,
@@ -501,7 +502,9 @@ public class ThroughputRunner {
         txn -> {
           // Check if the edge already exists by reading its primary key.
           ApiFuture<Struct> existingEdgeFut = txn.readRowAsync(
-              "GraphEdge", Key.of(label, key, edge_label, label2, key2), ImmutableList.of("key"));
+              "GraphEdge", Key.of(label, key, edge_label, label2, key2),
+                        ImmutableList.of("details", "first_seen", "last_seen",
+                            "creation_ts", "update_ts"));
 
           return ApiFutures.transformAsync(
               existingEdgeFut,
