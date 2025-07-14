@@ -16,7 +16,7 @@
 `./run_bench.sh --project <your_cloudspanner_project> --instance <your_instance> --database <your_db> --mode findSubGraph --numThreads 64 --numTotalKeys 5000000 --keyStartOffset 0`
 
 Notes:
-1. Client machine used to test: 24vCPU | 96GB RAM
+1. Client machines used to test each have: 24vCPU | 96GB RAM
 2. For findOrCreate*() calls: Use different `keyStartOffset` for each client if running multiple of them (at intervals of `numTotalKeys`)
 3. Use lower client threads for more expensive calls
 
