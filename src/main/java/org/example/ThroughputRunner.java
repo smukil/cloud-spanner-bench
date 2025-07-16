@@ -14,6 +14,7 @@ import com.google.cloud.spanner.Spanner;
 import com.google.cloud.spanner.SpannerOptions;
 import com.google.cloud.spanner.Statement;
 import com.google.cloud.spanner.Struct;
+import com.google.cloud.spanner.TimestampBound;
 import com.google.cloud.spanner.Value;
 import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.MoreExecutors;
@@ -29,6 +30,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -379,26 +381,24 @@ public class ThroughputRunner {
     Statement statement =
         Statement.newBuilder(graphQuery).bind("label").to(label).bind("key").to(key).build();
 
-    AsyncRunner runner = dbClient.runAsync(
-        Options.tag("app=ink-graph-poc,service=findSubGraph"),
-        Options.isolationLevel(IsolationLevel.REPEATABLE_READ));
-
-    return runner.runAsync(
-        txn -> {
-          try (com.google.cloud.spanner.ResultSet resultSet = txn.executeQuery(statement)) {
-            // Iterate through the entire result set to account for data download time.
-            while (resultSet.next()) {
-              // Row processing could be done here.
-            }
-            return ApiFutures.immediateFuture(null);
-          } catch (Exception e) {
-            System.err.printf(
-                "Error executing graph query for key: '%s'. Exception: %s%n",
-                key, e.getMessage());
-            throw new RuntimeException("Failed to execute graph query for key: " + key, e);
-          }
-        },
-        MoreExecutors.directExecutor());
+   // Use a singleUseReadOnlyTransaction for read-only operations.
+   // This is non-blocking and returns an ApiFuture.
+   try {
+     com.google.cloud.spanner.ResultSet resultSet =
+         dbClient.singleUseReadOnlyTransaction(TimestampBound.ofMaxStaleness(15, TimeUnit.SECONDS)).executeQuery(statement);
+     // To accurately measure throughput, we iterate through the entire result set
+     // to account for the time it takes to download all the data.
+     while (resultSet.next()) {
+       // You could process the results here if needed, for example:
+       // Struct row = resultSet.getCurrentRowAsStruct();
+       // String neighborLabel = row.getString("m_label");
+       // String neighborKey = row.getString("m_key");
+     }
+     return ApiFutures.immediateFuture(null);
+   } catch (Exception e) {
+     System.err.println("Error executing graph query for key: '" + key + "'. Exception: " + e.getMessage());
+     return ApiFutures.immediateFailedFuture(e);
+   }
   }
 
   /**
