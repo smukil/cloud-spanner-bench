@@ -23,6 +23,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.commons.cli.CommandLine;
@@ -41,8 +42,10 @@ import org.apache.commons.cli.ParseException;
  * <p>Modes of Operation:
  * <ul>
  * <li><b>load_nodes:</b> Inserts a specified number of nodes in batches.
- * <li><b>load_edges:</b> Inserts a predictable edge for each node.
- * <li><b>load_nodes_and_edges:</b> Executes node loading, then basic edge loading. This is
+ * <li><b>load_basic_edges:</b> Inserts a predictable edge for each node.
+ * <li><b>load_realistic_edges:</b> Inserts a variable number of edges for each node to simulate
+ * a real-world graph.
+ * <li><b>load_nodes_and_basic_edges:</b> Executes node loading, then basic edge loading. This is
  * the default mode.
  * </ul>
  */
@@ -64,7 +67,7 @@ public class SpannerDataLoader {
     String project = cmd.getOptionValue("project");
     String instance = cmd.getOptionValue("instance");
     String database = cmd.getOptionValue("database");
-    String mode = cmd.getOptionValue("mode", "load_nodes_and_edges");
+    String mode = cmd.getOptionValue("mode", "load_nodes_and_basic_edges");
     final int numKeys =
         Integer.parseInt(cmd.getOptionValue("numKeys", String.valueOf(DEFAULT_NUM_KEYS)));
     final int batchSize =
@@ -84,12 +87,16 @@ public class SpannerDataLoader {
         mode, numKeys, batchSize, numThreads);
 
     try {
-      if ("load_nodes".equals(mode) || "load_nodes_and_edges".equals(mode)) {
+      if ("load_nodes".equals(mode) || "load_nodes_and_basic_edges".equals(mode)) {
         loadNodes(dbClient, executorService, numKeys, batchSize, maxInFlightOperations);
       }
-      if ("load_edges".equals(mode) || "load_nodes_and_edges".equals(mode)) {
+      if ("load_basic_edges".equals(mode) || "load_nodes_and_basic_edges".equals(mode)) {
         // Every basic edge connects node[i] -> node[i + 2500000]
         loadBasicEdges(dbClient, executorService, numKeys - EDGE_KEY_OFFSET, batchSize);
+      }
+      if ("load_realistic_edges".equals(mode)) {
+        loadRealisticEdges(
+            dbClient, executorService, numKeys, batchSize, maxInFlightOperations);
       }
     } finally {
       System.out.println("Shutting down resources...");
@@ -198,17 +205,87 @@ public class SpannerDataLoader {
         mutationsLoaded.get(), duration / 1000.0);
   }
 
-  /** Creates a pre-defined JSON object of approximately 500 bytes. */
-  public static JsonObject create500ByteJsonObject() {
-    JsonObject dataObject = new JsonObject();
-    dataObject.addProperty("transactionId", "a1b2c3d4-e5f6-7890-1234-567890abcdef");
-    dataObject.addProperty("timestamp", "2025-07-10T17:55:00Z"); // Updated timestamp
-    dataObject.addProperty("status", "LOADED");
-    dataObject.addProperty("sourceSystem", "DataLoader-Primary");
-    String description =
-        "This is a sample description designed to add weight to the JSON object for data loading purposes.";
-    dataObject.addProperty("description", description);
-    return dataObject;
+  /**
+   * Orchestrates the loading of a realistic, variable number of edges for each source node.
+   *
+   * <p>For each source node, it generates outgoing edges based on a power-law distribution and
+   * inserts them in batches. This is more resource-intensive than basic edge loading.
+   */
+  private static void loadRealisticEdges(
+      DatabaseClient dbClient,
+      ExecutorService executor,
+      int numKeys,
+      int batchSize,
+      int maxInFlight)
+      throws InterruptedException {
+    System.out.println("\n----- Starting Realistic Edge Loading -----");
+    long startTime = System.currentTimeMillis();
+    Semaphore semaphore = new Semaphore(maxInFlight);
+    AtomicLong edgesGenerated = new AtomicLong(0);
+    AtomicLong mutationsLoaded = new AtomicLong(0);
+    List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+    List<Mutation> mutationBatch = new ArrayList<>(batchSize);
+    for (int i = 0; i < numKeys; i++) {
+      List<Mutation> edgesForNode = createRealisticEdgeMutationsForNode(i, numKeys);
+      edgesGenerated.addAndGet(edgesForNode.size());
+
+      for (Mutation edgeMutation : edgesForNode) {
+        mutationBatch.add(edgeMutation);
+        if (mutationBatch.size() >= batchSize) {
+          semaphore.acquire();
+          final List<Mutation> finalBatch = new ArrayList<>(mutationBatch);
+          CompletableFuture<Void> future =
+              CompletableFuture.runAsync(
+                  () -> {
+                    try {
+                      dbClient.write(finalBatch);
+                      mutationsLoaded.addAndGet(finalBatch.size());
+                    } catch (Exception e) {
+                      System.err.println("Failed to write realistic edge batch: " + e.getMessage());
+                    } finally {
+                      semaphore.release();
+                    }
+                  },
+                  executor);
+          futures.add(future);
+          mutationBatch.clear();
+        }
+      }
+      if (i > 0 && i % 10000 == 0) {
+        System.out.printf(
+            "Processed source node %,d of %,d. Total edges generated: %,d...%n",
+            i, numKeys, edgesGenerated.get());
+      }
+    }
+
+    // Handle any remaining mutations in the last batch
+    if (!mutationBatch.isEmpty()) {
+      semaphore.acquire();
+      final List<Mutation> finalBatch = new ArrayList<>(mutationBatch);
+      CompletableFuture<Void> future =
+          CompletableFuture.runAsync(
+              () -> {
+                try {
+                  dbClient.write(finalBatch);
+                  mutationsLoaded.addAndGet(finalBatch.size());
+                } catch (Exception e) {
+                  System.err.println("Failed to write final realistic edge batch: " + e.getMessage());
+                } finally {
+                  semaphore.release();
+                }
+              },
+              executor);
+      futures.add(future);
+    }
+
+    System.out.println("All realistic edge batches submitted. Waiting for completion...");
+    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+    long duration = System.currentTimeMillis() - startTime;
+    System.out.printf(
+        "----- Realistic Edge Loading Complete. %,d edge mutations loaded in %.2f seconds. -----%n",
+        mutationsLoaded.get(), duration / 1000.0);
   }
 
   /** Creates an insert mutation for a single node. */
@@ -246,6 +323,60 @@ public class SpannerDataLoader {
         .build();
   }
 
+  private static List<Mutation> createRealisticEdgeMutationsForNode(
+        int sourceNodeIndex, int numTotalNodes) {
+    final Random random = ThreadLocalRandom.current();
+
+    double percentile = random.nextDouble();
+    int targetDegree;
+    if (percentile >= 0.99) {
+        targetDegree = 650;
+
+    } else if (percentile >= 0.95) {
+        targetDegree = 300;
+
+    } else if (percentile >= 0.50) {
+        targetDegree = 45;
+
+    } else {
+        targetDegree = 1 + random.nextInt(44); // Range: [1, 45]
+    }
+
+    List<Mutation> mutations = new ArrayList<>(targetDegree);
+    Timestamp now = Timestamp.now();
+    String sourceKey = KEY_PREFIX + sourceNodeIndex;
+    String sourceLabel = "label-" + (sourceNodeIndex % 100);
+
+    for (int i = 0; i < targetDegree; i++) {
+        // Pick a random destination node, avoiding self-loops
+        int destNodeIndex;
+        do {
+            destNodeIndex = random.nextInt(numTotalNodes);
+        } while (destNodeIndex == sourceNodeIndex);
+
+        String destKey = KEY_PREFIX + destNodeIndex;
+        String destLabel = "label-" + (destNodeIndex % 100);
+        String edgeLabel = "edgelabel-" + random.nextInt(100);
+
+        mutations.add(
+            createEdgeInsertMutation(sourceLabel, sourceKey, edgeLabel, destLabel, destKey));
+    }
+    return mutations;
+  }
+
+  /** Creates a pre-defined JSON object of approximately 500 bytes. */
+  public static JsonObject create500ByteJsonObject() {
+    JsonObject dataObject = new JsonObject();
+    dataObject.addProperty("transactionId", "a1b2c3d4-e5f6-7890-1234-567890abcdef");
+    dataObject.addProperty("timestamp", "2025-07-10T17:55:00Z"); // Updated timestamp
+    dataObject.addProperty("status", "LOADED");
+    dataObject.addProperty("sourceSystem", "DataLoader-Primary");
+    String description =
+        "This is a sample description designed to add weight to the JSON object for data loading purposes.";
+    dataObject.addProperty("description", description);
+    return dataObject;
+  }
+
   /** Sets up the expected command-line options. */
   private static org.apache.commons.cli.Options setupOptions() {
     org.apache.commons.cli.Options options = new org.apache.commons.cli.Options();
@@ -256,7 +387,7 @@ public class SpannerDataLoader {
         "m",
         "mode",
         true,
-        "Load mode: load_nodes, load_edges, or load_nodes_and_edges (default).");
+        "Load mode: load_nodes, load_basic_edges, load_realistic_edges, or load_nodes_and_basic_edges (default).");
     options.addOption(
         null, "numKeys", true, "Total number of nodes to generate. Default: " + DEFAULT_NUM_KEYS);
     options.addOption(
