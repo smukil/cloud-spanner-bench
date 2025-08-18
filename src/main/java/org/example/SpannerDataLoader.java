@@ -15,8 +15,11 @@ import com.google.cloud.spanner.Value;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.gson.JsonObject;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -206,10 +209,26 @@ public class SpannerDataLoader {
   }
 
   /**
-   * Orchestrates the loading of a realistic, variable number of edges for each source node.
+   * Orchestrates loading a realistic graph where node degrees follow a specified distribution.
    *
-   * <p>For each source node, it generates outgoing edges based on a power-law distribution and
-   * inserts them in batches. This is more resource-intensive than basic edge loading.
+   * <p>This method uses a configuration model approach to generate a graph where the total degree
+   * (incoming + outgoing) of the nodes adheres to a power-law distribution.
+   *
+   * <p><b>Warning:</b> This process can be memory-intensive as it builds a list of all edge "stubs"
+   * in memory before pairing them.
+   *
+   * <p>The process involves four main phases:
+   *
+   * <ol>
+   * <li><b>Assign Degrees:</b> A target total degree is assigned to each node based on the
+   * distribution. The sum of degrees is forced to be even, as required for any graph.
+   * <li><b>Create Stubs:</b> A large list representing all connection points (stubs) is created.
+   * A node with degree `k` will have `k` entries in this list.
+   * <li><b>Shuffle Stubs:</b> The list of stubs is randomly shuffled to ensure random pairings.
+   * <li><b>Pair and Load:</b> Stubs are taken two at a time to form edges. These edges are then
+   * batched and written to Spanner as mutations. Self-loops and duplicate directed edges are
+   * avoided.
+   * </ol>
    */
   private static void loadRealisticEdges(
       DatabaseClient dbClient,
@@ -220,42 +239,96 @@ public class SpannerDataLoader {
       throws InterruptedException {
     System.out.println("\n----- Starting Realistic Edge Loading -----");
     long startTime = System.currentTimeMillis();
+    final Random random = ThreadLocalRandom.current();
+
+    // Phase 1: Assign a target degree to every node
+    System.out.println("Phase 1: Assigning target degrees to all nodes...");
+    int[] targetDegrees = new int[numKeys];
+    long sumOfDegrees = 0;
+    for (int i = 0; i < numKeys; i++) {
+      int degree = getTargetDegreeForNode(random);
+      targetDegrees[i] = degree;
+      sumOfDegrees += degree;
+    }
+
+    // The sum of degrees in a graph must be even. Adjust if necessary.
+    if (sumOfDegrees % 2 != 0) {
+      targetDegrees[0]++;
+      sumOfDegrees++;
+      System.out.println("Adjusted degree sum to be even.");
+    }
+    System.out.printf("Total number of edge endpoints (stubs): %,d%n", sumOfDegrees);
+
+    // Phase 2: Create a list of all edge "stubs"
+    System.out.println("Phase 2: Creating edge stubs... (This may be memory intensive)");
+    List<Integer> stubs = new ArrayList<>((int) sumOfDegrees);
+    for (int i = 0; i < numKeys; i++) {
+      for (int j = 0; j < targetDegrees[i]; j++) {
+        stubs.add(i);
+      }
+    }
+
+    // Phase 3: Shuffle the stubs to prepare for random pairing
+    System.out.println("Phase 3: Shuffling edge stubs...");
+    Collections.shuffle(stubs, random);
+    System.out.println("Shuffle complete.");
+
+    // Phase 4: Pair stubs to create edges and load them into Spanner
+    System.out.println("Phase 4: Pairing stubs and loading edges into Spanner...");
     Semaphore semaphore = new Semaphore(maxInFlight);
-    AtomicLong edgesGenerated = new AtomicLong(0);
     AtomicLong mutationsLoaded = new AtomicLong(0);
     List<CompletableFuture<Void>> futures = new ArrayList<>();
-
+    Set<String> createdEdges = new HashSet<>();
     List<Mutation> mutationBatch = new ArrayList<>(batchSize);
-    for (int i = 0; i < numKeys; i++) {
-      List<Mutation> edgesForNode = createRealisticEdgeMutationsForNode(i, numKeys);
-      edgesGenerated.addAndGet(edgesForNode.size());
+    long totalEdgesToCreate = sumOfDegrees / 2;
 
-      for (Mutation edgeMutation : edgesForNode) {
-        mutationBatch.add(edgeMutation);
-        if (mutationBatch.size() >= batchSize) {
-          semaphore.acquire();
-          final List<Mutation> finalBatch = new ArrayList<>(mutationBatch);
-          CompletableFuture<Void> future =
-              CompletableFuture.runAsync(
-                  () -> {
-                    try {
-                      dbClient.write(finalBatch);
-                      mutationsLoaded.addAndGet(finalBatch.size());
-                    } catch (Exception e) {
-                      System.err.println("Failed to write realistic edge batch: " + e.getMessage());
-                    } finally {
-                      semaphore.release();
-                    }
-                  },
-                  executor);
-          futures.add(future);
-          mutationBatch.clear();
-        }
+    for (int i = 0; i < stubs.size(); i += 2) {
+      int sourceNodeIndex = stubs.get(i);
+      int destNodeIndex = stubs.get(i + 1);
+
+      // Avoid self-loops
+      if (sourceNodeIndex == destNodeIndex) {
+        continue;
       }
-      if (i > 0 && i % 10000 == 0) {
-        System.out.printf(
-            "Processed source node %,d of %,d. Total edges generated: %,d...%n",
-            i, numKeys, edgesGenerated.get());
+
+      // Avoid creating the same directed edge twice.
+      // The add() method returns false if the element is already in the set.
+      String edgeKey = sourceNodeIndex + "->" + destNodeIndex;
+      if (!createdEdges.add(edgeKey)) {
+        continue;
+      }
+
+      String sourceKey = KEY_PREFIX + sourceNodeIndex;
+      String sourceLabel = "label-" + (sourceNodeIndex % 100);
+      String destKey = KEY_PREFIX + destNodeIndex;
+      String destLabel = "label-" + (destNodeIndex % 100);
+      String edgeLabel = "edgelabel-" + random.nextInt(100);
+
+      mutationBatch.add(
+          createEdgeInsertMutation(sourceLabel, sourceKey, edgeLabel, destLabel, destKey));
+
+      if (mutationBatch.size() >= batchSize) {
+        semaphore.acquire();
+        final List<Mutation> finalBatch = new ArrayList<>(mutationBatch);
+        CompletableFuture<Void> future =
+            CompletableFuture.runAsync(
+                () -> {
+                  try {
+                    dbClient.write(finalBatch);
+                    long total = mutationsLoaded.addAndGet(finalBatch.size());
+                    if (total % (batchSize * 50) == 0) {
+                      System.out.printf(
+                          "Loaded %,d of ~%,d edge mutations...%n", total, totalEdgesToCreate);
+                    }
+                  } catch (Exception e) {
+                    System.err.println("Failed to write realistic edge batch: " + e.getMessage());
+                  } finally {
+                    semaphore.release();
+                  }
+                },
+                executor);
+        futures.add(future);
+        mutationBatch.clear();
       }
     }
 
@@ -270,7 +343,8 @@ public class SpannerDataLoader {
                   dbClient.write(finalBatch);
                   mutationsLoaded.addAndGet(finalBatch.size());
                 } catch (Exception e) {
-                  System.err.println("Failed to write final realistic edge batch: " + e.getMessage());
+                  System.err.println(
+                      "Failed to write final realistic edge batch: " + e.getMessage());
                 } finally {
                   semaphore.release();
                 }
@@ -286,6 +360,38 @@ public class SpannerDataLoader {
     System.out.printf(
         "----- Realistic Edge Loading Complete. %,d edge mutations loaded in %.2f seconds. -----%n",
         mutationsLoaded.get(), duration / 1000.0);
+  }
+
+  /**
+   * Determines the target total degree for a single node based on a pre-defined distribution.
+   *
+   * @param random A Random instance.
+   * @return The target degree for a node.
+   */
+  private static int getTargetDegreeForNode(Random random) {
+    double percentile = random.nextDouble();
+    if (percentile >= 0.999) return 1200; // P99.9
+    if (percentile >= 0.99) return 650; // P99
+    if (percentile >= 0.95) return 300; // P95
+    if (percentile >= 0.90) return 185; // P90
+    if (percentile >= 0.75) return 80; // P75
+    if (percentile >= 0.50) return 45; // P50
+    if (percentile >= 0.25) return 20; // P25
+    if (percentile >= 0.10) return 10; // P10
+    return 1; // For the bottom 10%
+  }
+
+  private static int getTargetDegreeForNodeAvg80(Random random) {
+    double percentile = random.nextDouble();
+    if (percentile >= 0.999) return 1500; // P99.9
+    if (percentile >= 0.99) return 800; // P99
+    if (percentile >= 0.95) return 400; // P95
+    if (percentile >= 0.90) return 250; // P90
+    if (percentile >= 0.75) return 120; // P75
+    if (percentile >= 0.50) return 65; // P50
+    if (percentile >= 0.25) return 30; // P25
+    if (percentile >= 0.10) return 15; // P10
+    return 2; // For the bottom 10%
   }
 
   /** Creates an insert mutation for a single node. */
@@ -321,47 +427,6 @@ public class SpannerDataLoader {
         .set("creation_ts").to(now)
         .set("update_ts").to(now)
         .build();
-  }
-
-  private static List<Mutation> createRealisticEdgeMutationsForNode(
-        int sourceNodeIndex, int numTotalNodes) {
-    final Random random = ThreadLocalRandom.current();
-
-    double percentile = random.nextDouble();
-    int targetDegree;
-    if (percentile >= 0.99) {
-        targetDegree = 650;
-
-    } else if (percentile >= 0.95) {
-        targetDegree = 300;
-
-    } else if (percentile >= 0.50) {
-        targetDegree = 45;
-
-    } else {
-        targetDegree = 1 + random.nextInt(44); // Range: [1, 45]
-    }
-
-    List<Mutation> mutations = new ArrayList<>(targetDegree);
-    Timestamp now = Timestamp.now();
-    String sourceKey = KEY_PREFIX + sourceNodeIndex;
-    String sourceLabel = "label-" + (sourceNodeIndex % 100);
-
-    for (int i = 0; i < targetDegree; i++) {
-        // Pick a random destination node, avoiding self-loops
-        int destNodeIndex;
-        do {
-            destNodeIndex = random.nextInt(numTotalNodes);
-        } while (destNodeIndex == sourceNodeIndex);
-
-        String destKey = KEY_PREFIX + destNodeIndex;
-        String destLabel = "label-" + (destNodeIndex % 100);
-        String edgeLabel = "edgelabel-" + random.nextInt(100);
-
-        mutations.add(
-            createEdgeInsertMutation(sourceLabel, sourceKey, edgeLabel, destLabel, destKey));
-    }
-    return mutations;
   }
 
   /** Creates a pre-defined JSON object of approximately 500 bytes. */
