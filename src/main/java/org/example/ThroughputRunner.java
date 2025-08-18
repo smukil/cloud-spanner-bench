@@ -8,8 +8,10 @@ import com.google.cloud.spanner.AsyncRunner;
 import com.google.cloud.spanner.DatabaseClient;
 import com.google.cloud.spanner.DatabaseId;
 import com.google.cloud.spanner.Key;
+import com.google.cloud.spanner.KeySet;
 import com.google.cloud.spanner.Mutation;
 import com.google.cloud.spanner.Options;
+import com.google.cloud.spanner.ResultSet;
 import com.google.cloud.spanner.Spanner;
 import com.google.cloud.spanner.SpannerOptions;
 import com.google.cloud.spanner.Statement;
@@ -176,7 +178,7 @@ public class ThroughputRunner {
               key = KEY_PREFIX + (keyStartOffset + currentIndex);
             }
             String label = "label-" + ((keyStartOffset + currentIndex) % 100);
-            dispatchFuture = findOrCreateNodeAsync(
+            dispatchFuture = findOrCreateNodeFastAsync(
                 dbClient, label, key, hardcodedDetails, 0, executorService);
             break;
           }
@@ -205,7 +207,7 @@ public class ThroughputRunner {
               label2 = "label-" + ((keyStartOffset + currentIndex + EDGE_KEY_OFFSET) % 100);
               edgeLabel = "edgelabel-" + (currentIndex % 100);
             }
-            dispatchFuture = findOrCreateEdgeAsync(dbClient, label1, key1, edgeLabel, key2, label2,
+            dispatchFuture = findOrCreateEdgeFastAsync(dbClient, label1, key1, edgeLabel, key2, label2,
                 hardcodedDetails, 0, executorService);
             break;
           }
@@ -229,6 +231,88 @@ public class ThroughputRunner {
             String key = KEY_PREFIX + (keyStartOffset + currentIndex);
             String label = "label-" + ((keyStartOffset + currentIndex) % 100);
             dispatchFuture = findSubGraphAsyncCaller(dbClient, label, key, executorService);
+            break;
+          }
+          case "mixed_workload": {
+            double workloadChoice = random.nextDouble();
+            if (workloadChoice < 0.45) { // 45% findOrCreateNode
+              String key;
+              if (random.nextDouble() < 0.30) {
+                key = NEW_KEY_PREFIX + (keyStartOffset + currentIndex);
+              } else {
+                key = KEY_PREFIX + (keyStartOffset + currentIndex);
+              }
+              String label = "label-" + ((keyStartOffset + currentIndex) % 100);
+              dispatchFuture = findOrCreateNodeFastAsync(
+                  dbClient, label, key, hardcodedDetails, 0, executorService);
+
+            } else if (workloadChoice < 0.90) { // 45% findOrCreateEdge
+              String key1, key2, label1, label2, edgeLabel;
+              if (random.nextDouble() < 0.30) {
+                int sourceIndex = random.nextInt(numTotalKeys);
+                int destIndex;
+                do {
+                  destIndex = random.nextInt(numTotalKeys);
+                } while (sourceIndex == destIndex);
+
+                key1 = KEY_PREFIX + (keyStartOffset + sourceIndex);
+                label1 = "label-" + ((keyStartOffset + sourceIndex) % 100);
+                key2 = KEY_PREFIX + (keyStartOffset + destIndex);
+                label2 = "label-" + ((keyStartOffset + destIndex) % 100);
+                edgeLabel = "new-edgelabel-" + (currentIndex % 100);
+              } else {
+                key1 = KEY_PREFIX + (keyStartOffset + currentIndex);
+                label1 = "label-" + ((keyStartOffset + currentIndex) % 100);
+                key2 = KEY_PREFIX + (keyStartOffset + currentIndex + EDGE_KEY_OFFSET);
+                label2 = "label-" + ((keyStartOffset + currentIndex + EDGE_KEY_OFFSET) % 100);
+                edgeLabel = "edgelabel-" + (currentIndex % 100);
+              }
+              dispatchFuture = findOrCreateEdgeFastAsync(dbClient, label1, key1, edgeLabel, key2, label2,
+                  hardcodedDetails, 0, executorService);
+            } else { // 10% findSubGraph
+              String key = KEY_PREFIX + (keyStartOffset + currentIndex);
+              String label = "label-" + ((keyStartOffset + currentIndex) % 100);
+              dispatchFuture = findSubGraphAsyncCaller(dbClient, label, key, executorService);
+            }
+            break;
+          }
+          case "mixed_workload_no_reads": {
+            double workloadChoice = random.nextDouble();
+            if (workloadChoice < 0.50) { // 50% findOrCreateNode
+              String key;
+              if (random.nextDouble() < 0.30) {
+                key = NEW_KEY_PREFIX + (keyStartOffset + currentIndex);
+              } else {
+                key = KEY_PREFIX + (keyStartOffset + currentIndex);
+              }
+              String label = "label-" + ((keyStartOffset + currentIndex) % 100);
+              dispatchFuture = findOrCreateNodeFastAsync(
+                  dbClient, label, key, hardcodedDetails, 0, executorService);
+
+            } else { // 50% findOrCreateEdge
+              String key1, key2, label1, label2, edgeLabel;
+              if (random.nextDouble() < 0.30) {
+                int sourceIndex = random.nextInt(numTotalKeys);
+                int destIndex;
+                do {
+                  destIndex = random.nextInt(numTotalKeys);
+                } while (sourceIndex == destIndex);
+
+                key1 = KEY_PREFIX + (keyStartOffset + sourceIndex);
+                label1 = "label-" + ((keyStartOffset + sourceIndex) % 100);
+                key2 = KEY_PREFIX + (keyStartOffset + destIndex);
+                label2 = "label-" + ((keyStartOffset + destIndex) % 100);
+                edgeLabel = "new-edgelabel-" + (currentIndex % 100);
+              } else {
+                key1 = KEY_PREFIX + (keyStartOffset + currentIndex);
+                label1 = "label-" + ((keyStartOffset + currentIndex) % 100);
+                key2 = KEY_PREFIX + (keyStartOffset + currentIndex + EDGE_KEY_OFFSET);
+                label2 = "label-" + ((keyStartOffset + currentIndex + EDGE_KEY_OFFSET) % 100);
+                edgeLabel = "edgelabel-" + (currentIndex % 100);
+              }
+              dispatchFuture = findOrCreateEdgeFastAsync(dbClient, label1, key1, edgeLabel, key2, label2,
+                  hardcodedDetails, 0, executorService);
+            }
             break;
           }
           default:
@@ -374,7 +458,7 @@ public class ThroughputRunner {
       DatabaseClient dbClient, String label, String key) {
     String graphQuery =
         "GRAPH AFGraphSchemaless "
-            + "MATCH (n {label:@label, key:@key}) -[e:Forward|Reverse]-> (m) "
+            + "MATCH (n {label:@label, key:@key}) -[e:Forward]- (m) "
             + "RETURN n.details AS n_details, e.edge_label AS e_label, e.details AS deets, "
             + "m.label AS m_label, m.key AS m_key, m.details AS m_details";
 
@@ -464,6 +548,71 @@ public class ThroughputRunner {
   }
 
   /**
+   * Submits an {@link #edgeAsyncRunnerFast} task to the executor service.
+   */
+  private static CompletableFuture<ApiFuture<Long>> findOrCreateNodeFastAsync(
+      DatabaseClient databaseClient,
+      String label,
+      String key,
+      JsonObject details,
+      int maxCommitDelayMillis,
+      ExecutorService executor) {
+    return CompletableFuture.supplyAsync(
+        () -> nodeAsyncRunnerFast(
+            databaseClient, label, key, details, maxCommitDelayMillis),
+        executor);
+  }
+
+  /**
+   * Asynchronously finds an edge or creates it if it doesn't exist.
+   *
+   * <p>This version performs a non-transactional read first. If the edge does not exist, it
+   * then starts a separate transaction to perform the insert. This can be faster than a
+   * read-write transaction when the item is frequently found.
+   *
+   * @return An {@link ApiFuture} containing the number of rows created (0 or 1).
+   */
+  private static ApiFuture<Long> nodeAsyncRunnerFast(
+      DatabaseClient databaseClient,
+      String label,
+      String key,
+      JsonObject details,
+      int maxCommitDelayMillis) {
+
+    // First, perform a non-transactional read to see if the node exists.
+    ResultSet resultset = databaseClient.singleUse().read(
+        "GraphNode", KeySet.prefixRange(Key.of(label, key)),
+                         ImmutableList.of("details", "first_seen", "last_seen",
+                             "creation_ts", "update_ts"));
+
+    if (resultset.next()) {
+      return ApiFutures.immediateFuture(0L);
+    }
+    AsyncRunner runner =
+        databaseClient.runAsync(Options.tag("app=ink-graph-poc,service=findOrCreateNodeFast"));
+    return runner.runAsync(
+        txn -> {
+                // Edge not found, build and buffer an insert mutation.
+                details.addProperty("upd_count", 0);
+                Timestamp currentTime = Timestamp.now();
+                Mutation insertMutation =
+                    Mutation.newInsertBuilder("GraphNode")
+                        .set("label").to(label)
+                        .set("key").to(key)
+                        .set("details").to(Value.json(details.toString()))
+                        .set("first_seen").to(currentTime)
+                        .set("last_seen").to(currentTime)
+                        .set("creation_ts").to(currentTime)
+                        .set("update_ts").to(currentTime)
+                        .build();
+
+                txn.buffer(insertMutation);
+                return ApiFutures.immediateFuture(1L); // One row will be created.
+        },
+        MoreExecutors.directExecutor());
+  }
+
+  /**
    * Submits an {@link #edgeAsyncRunner} task to the executor service.
    */
   private static CompletableFuture<ApiFuture<Long>> findOrCreateEdgeAsync(
@@ -535,6 +684,80 @@ public class ThroughputRunner {
                 return ApiFutures.immediateFuture(1L); // One row will be created.
               },
               MoreExecutors.directExecutor());
+        },
+        MoreExecutors.directExecutor());
+  }
+
+  /**
+   * Submits an {@link #edgeAsyncRunnerFast} task to the executor service.
+   */
+  private static CompletableFuture<ApiFuture<Long>> findOrCreateEdgeFastAsync(
+      DatabaseClient databaseClient,
+      String label,
+      String key,
+      String edge_label,
+      String key2,
+      String label2,
+      JsonObject details,
+      int maxCommitDelayMillis,
+      ExecutorService executor) {
+    return CompletableFuture.supplyAsync(
+        () -> edgeAsyncRunnerFast(
+            databaseClient, label, key, edge_label, key2, label2, details, maxCommitDelayMillis),
+        executor);
+  }
+
+  /**
+   * Asynchronously finds an edge or creates it if it doesn't exist.
+   *
+   * <p>This version performs a non-transactional read first. If the edge does not exist, it
+   * then starts a separate transaction to perform the insert. This can be faster than a
+   * read-write transaction when the item is frequently found.
+   *
+   * @return An {@link ApiFuture} containing the number of rows created (0 or 1).
+   */
+  private static ApiFuture<Long> edgeAsyncRunnerFast(
+      DatabaseClient databaseClient,
+      String label,
+      String key,
+      String edge_label,
+      String key2,
+      String label2,
+      JsonObject details,
+      int maxCommitDelayMillis) {
+
+    // First, perform a non-transactional read to see if the edge exists.
+    ResultSet resultset = databaseClient.singleUse().read(
+        "GraphEdge", KeySet.prefixRange(Key.of(label, key, edge_label, label2, key2)),
+                         ImmutableList.of("details", "first_seen", "last_seen",
+                             "creation_ts", "update_ts"));
+
+    if (resultset.next()) {
+      return ApiFutures.immediateFuture(0L);
+    }
+    AsyncRunner runner =
+        databaseClient.runAsync(Options.tag("app=ink-graph-poc,service=findOrCreateEdgeFast"));
+    return runner.runAsync(
+        txn -> {
+                // Edge not found, build and buffer an insert mutation.
+                details.addProperty("upd_count", 0);
+                Timestamp currentTime = Timestamp.now();
+                Mutation insertMutation =
+                    Mutation.newInsertBuilder("GraphEdge")
+                        .set("label").to(label)
+                        .set("key").to(key)
+                        .set("edge_label").to(edge_label)
+                        .set("other_node_label").to(label2)
+                        .set("other_node_key").to(key2)
+                        .set("details").to(Value.json(details.toString()))
+                        .set("first_seen").to(currentTime)
+                        .set("last_seen").to(currentTime)
+                        .set("creation_ts").to(currentTime)
+                        .set("update_ts").to(currentTime)
+                        .build();
+
+                txn.buffer(insertMutation);
+                return ApiFutures.immediateFuture(1L); // One row will be created.
         },
         MoreExecutors.directExecutor());
   }
